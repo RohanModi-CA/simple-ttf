@@ -68,8 +68,21 @@ struct cmap_indices
 struct EBLC_information
 {
 	uint32_t image_data_offset;
-	uint32_t sbit_offset;
+	uint32_t index_form1_sbit_offset;
 	uint16_t image_format;
+	uint16_t index_format;
+	uint32_t index_form2_image_size;
+	uint32_t image_form5_bitmap_offset;
+	uint8_t  embedded_metrics_height;
+	uint8_t  embedded_metrics_width;
+};
+
+struct TTF_info
+{
+	struct header_contents header;
+	struct cmap_indices cmap;
+	struct EBLC_information eblc;
+	FILE *fp;
 };
 
 struct pixel_data
@@ -486,30 +499,49 @@ static struct EBLC_information parse_EBLC(uint16_t glyph_index, uint8_t font_px,
 	struct EBLC_information output;
 	{ // Parse the index subtable
 		// Index subtable record is 2 uint16s, index_format and image_format, and a uint32, image_data_offset.
-		uint16_t index_format;
-		fread(&index_format, 2, 1, fp);
+		fread(&output.index_format, 2, 1, fp);
 		fread(&output.image_format, 2, 1, fp);
 		fread(&output.image_data_offset, 4, 1, fp);
-		fix_endianness(&index_format, 2);
+		fix_endianness(&output.index_format, 2);
 		fix_endianness(&output.image_format, 2);
 		fix_endianness(&output.image_data_offset, 4);
 
 		// Format 1 is the most common, so let's stick with that.
-		if(index_format != 1)
+		if (!(output.index_format == 1 || output.index_format == 2 ))
 		{
-			fprintf(stderr, "simple_ttf: index subtable has index_format %hu, which is not supported. Exiting.\n", index_format);
+			fprintf(stderr, "simple_ttf: index subtable has index_format %hu, which is not supported. Exiting.\n", output.index_format);
 			exit(1);
 		}
+
 		
-		// Now, all we must do is get the EBDT offset.
-		uint32_t sbit_offset_array_index = glyph_index - correct_first_glyph_index;
-		fseek(fp, 4*sbit_offset_array_index, SEEK_CUR);
-		fread(&output.sbit_offset, 4, 1, fp);
-		fix_endianness(&output.sbit_offset, 4);
+		if(output.image_format == 1)
+		{
+			// Now, all we must do is get the EBDT offset.
+			uint32_t sbit_offset_array_index = glyph_index - correct_first_glyph_index;
+			fseek(fp, 4*sbit_offset_array_index, SEEK_CUR);
+			fread(&output.index_form1_sbit_offset, 4, 1, fp);
+			fix_endianness(&output.index_form1_sbit_offset, 4);
+		}
+
+		// If it is format 2
+		if(output.index_format == 2)
+		{
+			fread(&output.index_form2_image_size, 4, 1, fp);
+			fix_endianness(&output.index_form2_image_size, 4);
+			output.image_form5_bitmap_offset = output.image_data_offset + (glyph_index - correct_first_glyph_index) * output.index_form2_image_size;
+
+			// Now let's read the first two entries off of the BigGlyphsMetricsRecord which follows.
+			fread(&output.embedded_metrics_height, 1, 1, fp);
+			fread(&output.embedded_metrics_width, 1, 1, fp);
+		}
+
 	} // End parsing the index subtable
 	
 	return output;
 }
+
+
+
 
 static struct pixel_data read_EBDT(struct EBLC_information eblc, struct header_contents header, FILE *fp)
 {
@@ -529,44 +561,115 @@ static struct pixel_data read_EBDT(struct EBLC_information eblc, struct header_c
 		}
 	} // End Checking versioning
 	
-	// Let's go to the correct spot in the EBDT table.
-	fseek(fp, header.offset_EBDT +  eblc.image_data_offset + eblc.sbit_offset, SEEK_SET);
-
-	// We will handle image format 2 for now.
-	if(eblc.image_format != 2)
+	if (eblc.index_format == 1)
 	{
-		fprintf(stderr, "simple_ttf: Image format %hu in EBDT is unsupported. Exiting.\n", eblc.image_format);
-		exit(1);
-	}
+		// Let's go to the correct spot in the EBDT table.
+		fseek(fp, header.offset_EBDT +  eblc.image_data_offset + eblc.index_form1_sbit_offset, SEEK_SET);
 
-	// Prepare the output
-	struct pixel_data out;
+		// We will handle image format 2 and image format 7 for now.
+		if (!(eblc.image_format == 2 || eblc.image_format == 7))
+		{
+			fprintf(stderr, "simple_ttf: Image format %hu in EBDT is unsupported for index format 1. Exiting.\n", eblc.image_format);
+			exit(1);
+		}
 
-	// Now let's read the SmallGlyphMetricsRecord
-	{ // Reading the SmallGlyphMetricsRecord
-		int8_t bearingX;
-		int8_t bearingY;
-		uint8_t advance;
+		// Prepare the output
+		struct pixel_data out;
 
-		fread(&out.height, 1, 1, fp);
-		fread(&out.width, 1, 1, fp);
-		fread(&bearingX, 1, 1, fp);
-		fread(&bearingY, 1, 1, fp);
-		fread(&advance, 1, 1, fp);
-	} // End Reading the SmallGlyphMetricsRecord.
-	
-	// Now, we need to actually read the bits. There are bmp_width columns and out.height rows.
-	// The rows are placed sequentially, and do not wait for byte boundaries.
+		{ // Read the MetricsRecords, Small for format 2, Large for 7.
+			if (eblc.image_format == 2)
+			{ // Reading the SmallGlyphMetricsRecord
+				int8_t bearingX;
+				int8_t bearingY;
+				uint8_t advance;
 
-	// We just need to extract all the data. We know there is bmp_width * out.height pixels, and we need
-	// to ensure it is divisible by 8 to fit in a byte.
-	out.bytes_to_read = ceil( (float)(out.width*out.height)/8.0f );
-	out.pixel_data = (uint8_t*) malloc(out.bytes_to_read);
-	
-	fread(out.pixel_data, 1, out.bytes_to_read, fp);
-	fix_endianness(out.pixel_data, out.bytes_to_read);
+				fread(&out.height, 1, 1, fp);
+				fread(&out.width, 1, 1, fp);
+				fread(&bearingX, 1, 1, fp);
+				fread(&bearingY, 1, 1, fp);
+				fread(&advance, 1, 1, fp);
+			} // End Reading the SmallGlyphMetricsRecord.
+
+			else if (eblc.image_format == 7)
+			{
+				fread(&out.height, 1, 1, fp);
+				fread(&out.width, 1, 1, fp);	
+
+				fseek(fp, 6, SEEK_CUR);
+			}
+
+
+		} // End read the MetricsRecords.
+		
+		// Now, we need to actually read the bits. There are bmp_width columns and out.height rows.
+		// The rows are placed sequentially, and do not wait for byte boundaries.
+
+		// We just need to extract all the data. We know there is bmp_width * out.height pixels, and we need
+		// to ensure it is divisible by 8 to fit in a byte.
+		out.bytes_to_read = ceil( (float)(out.width*out.height)/8.0f );
+		out.pixel_data = (uint8_t*) malloc(out.bytes_to_read);
+		
+		fread(out.pixel_data, 1, out.bytes_to_read, fp);
+	return out;
+	} // end eblc.index_format == 1
+
+	else if(eblc.index_format == 2)
+	{
+		struct pixel_data out;
+		{ // We only handle image formats 5 and 7. Check.
+			if (!(eblc.image_format == 5 || eblc.image_format == 17))
+
+			{
+				fprintf(stderr,"simple_ttf.read_EBDT: image_format %hu unsupported for index format 2. Exiting.\n", eblc.image_format);
+				exit(1);
+			}
+		} // End checking for image format 5 and 7.
+
+		// Go to the correct spot in the EBDT table.
+		{
+			if(eblc.image_format == 5)
+			{
+				// Get the Metrics from the embedded ones from EBLC.
+				out.height = eblc.embedded_metrics_height;
+				out.width  = eblc.embedded_metrics_width;
+
+				fseek(fp, header.offset_EBDT + eblc.image_form5_bitmap_offset, SEEK_SET);
+			}
+			else if (eblc.image_format == 7)
+			{
+				fseek(fp, header.offset_EBDT + eblc.image_form5_bitmap_offset, SEEK_SET);
+
+				// A BigGlyphsMetricsRecord is 8 (u)int8_ts.
+				fread(&out.height, 1, 1, fp);
+				fread(&out.width, 1, 1, fp);
+				fseek(fp, 6, SEEK_CUR);
+			}
+		} // End going to the start of the image data array
+
+
+		// Now, let's read the image data into an array, which we know should be image size long.
+		// This is *not* affected by endianness, since each byte is considered independant.
+
+		out.bytes_to_read = eblc.index_form2_image_size;
+		out.pixel_data = (uint8_t *) malloc(out.bytes_to_read);
+		fread(out.pixel_data, 1, out.bytes_to_read, fp);
+
+
+		
+
+
 
 	return out;
+	} // End eblc.index_format == 2.
+
+	else 
+	{
+		fprintf(stderr, "simple_ttf.read_EBDT: index_format %hu not supported. Exiting.\n", eblc.index_format);
+		exit(1);
+	}
+	
+
+
 }
 
 static void print_binary(uint8_t *pd, uint16_t bytes_to_read)
@@ -591,6 +694,357 @@ static void print_binary(uint8_t *pd, uint16_t bytes_to_read)
 	printf("\n");
 }
 
+// Takes an array of bytes, a zero indexed bit number, and the value of the bit.
+static void set_bit(uint8_t *pd, uint64_t bit_number, bool bit)
+{
+	// First, let's find the correct byte.
+	uint32_t correct_byte = (bit_number/8); // This truncates down.
+	// Now, let's find the bit position.
+	uint8_t bit_of_byte = bit_number % 8;
+	
+	uint8_t comparison_byte_true = (0b10000000 >> bit_of_byte);
+	uint8_t comparison_byte_false = ~comparison_byte_true;
+
+	if (!bit)
+	{
+		pd[correct_byte] &= comparison_byte_false;
+	}
+	else 
+	{
+		pd[correct_byte] |= comparison_byte_true;
+	}
+}
+
+static bool get_bit(uint8_t *pd, uint64_t bit_number)
+{
+	// First we will navigate to the byte we are interested in. 
+	uint64_t byte = bit_number/8; // truncates.
+	uint8_t bit_num = bit_number % 8;
+
+	// Let's create our comparison bit.
+	uint8_t comparison_byte = 0b10000000 >> bit_num;
+	uint8_t compared = comparison_byte & pd[byte];
+	
+	return (bool) (compared > 0);
+}
+
+// Takes a pixel_data struct and an integer height (px/bits). This will fill the pixel data with 0s to the height limit.
+static void pad_pd_to_height(struct pixel_data pd, uint16_t height)
+{
+	uint16_t rows_to_fill = height - pd.height;
+	uint16_t new_bytes = ceil(((float)(height * pd.width))/8.0);
+	
+	// Declare a new, temporary byte array. Initialize with zeros.
+	uint8_t *temp = (uint8_t*) calloc(new_bytes, 1);
+
+	// The new blank rows take rows_to_fill * pd.width bits.
+	// From here, we just need to copy the existing bits.
+	uint16_t start = rows_to_fill * pd.width;
+	uint16_t old_bits = pd.width * pd.height;
+	for(int i=0; i<old_bits; ++i)
+	{
+		(temp[start+i]) = get_bit(pd.pixel_data, i);
+	}
+	// And the remaining bits are left as zeros from calloc.
+	free(pd.pixel_data);
+	pd.pixel_data = temp;
+	return;
+}
+
+
+// This will take an array of pixel_datas, all of which are at the same height. Then, it will create
+// a new pixel data, smush them all together, and free the input. Additionally, takes the letter_tracking (spacing between each letter, in pixels).
+static struct pixel_data smush_pds(struct pixel_data *pd_array, uint16_t how_many, uint8_t letter_tracking)
+{
+	uint16_t summed_width = 0;
+	{ // Check the heights are equal, and sum up the widths (including the tracking).
+		for (int i=0; i<how_many; ++i)
+		{
+			if(pd_array[i].height != pd_array[0].height)
+			{
+				fprintf(stderr, "simple_ttf: smush_pds requres an array of pixel datas at the same height. Exiting.");
+				exit(1);
+			}
+			summed_width += (pd_array[i].width + letter_tracking);
+		}
+	} // End checking height equality and summing widths.
+	
+	// Now, the output, in bits, will be the width times the height. We need that in bytes.
+	uint32_t bytes_out = ceil(((double) summed_width * pd_array[0].height)/8.0);
+	struct pixel_data out; out.height = pd_array[0].height; out.width = summed_width;
+	out.pixel_data = (uint8_t *) calloc(1, bytes_out);
+
+	uint16_t previous_bit_owner_index;
+	uint16_t previous_bit_owner_col;
+	{ // Now, we must fill in the new pixel array, going line by line, and then, bit by bit.
+		for (int row=0; row<out.height; ++row)
+		{
+			previous_bit_owner_index=0;
+			previous_bit_owner_col=0;
+
+			// Now, iterate through the bits. The bits start at current_row * columns
+			for(int bit=row*out.width; bit<((row+1)*out.width); ++bit)
+			{
+
+				/* From here, we need to decide how to identify which bit to take, from which
+				 * pixel array. We will check if the previous_bit_owner_index has 
+				 * previous_bit_owner_col columns. If so, we skip and move on.
+				 */
+
+				if (previous_bit_owner_col == pd_array[previous_bit_owner_index].width)
+				{
+					// Move on by resetting that column to zero, and moving forward the index.
+					previous_bit_owner_col = 0;
+					++previous_bit_owner_index;
+
+
+					// Check to ensure we don't read out of bounds.
+					if(previous_bit_owner_index >= how_many)
+					{
+						// Just go to the next row. 
+						break;
+					}
+
+					// To add the letter tracking, we just skip forward by letter tracking bits,
+					// since the out array is calloc'ed to zeros. 
+					// Note that the loop itself will skip one here, so we skip (letter_tracking-1) bits.
+					bit += letter_tracking - 1;
+				}
+				else
+				{
+					set_bit(out.pixel_data, bit, 
+							get_bit(pd_array[previous_bit_owner_index].pixel_data,
+								row*pd_array[previous_bit_owner_index].width + previous_bit_owner_col));
+					++previous_bit_owner_col;
+				}
+
+				
+
+			}
+
+		} // End of Rows Loop.
+	} // End of filling in the new pixel array.
+
+	// Finally, we free all of the input arrays.
+	for(int i=0; i<how_many; ++i)
+	{
+		free(pd_array[i].pixel_data);
+	}
+	free(pd_array);
+
+	return out;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+struct byte_data
+{
+	uint8_t width;
+	uint8_t height;
+	uint8_t *color_map;
+};
+
+
+
+
+
+/* This takes a struct pixel_data and converts it to a width*height byte array of uint8_t 
+ * made of the parameter on and offs. */
+struct byte_data convert_to_bytes(struct pixel_data pd, uint8_t on, uint8_t off)
+{
+	struct byte_data bd;
+	bd.color_map = (uint8_t*) malloc(pd.height * pd.width);
+	bd.height = pd.height;
+	bd.width = pd.width;
+
+	for(int i=0; i<pd.height * pd.width; ++i)
+	{
+		if (get_bit(pd.pixel_data, i))
+		{
+			bd.color_map[i] = on;
+		}
+		else 
+		{
+			bd.color_map[i] = off;
+		}
+	}
+	return bd;
+}
+
+void normalize_byte_data_height(struct byte_data *bd, uint8_t off, uint8_t height)
+{
+	if(height<bd->height)
+	{
+		fprintf(stderr, "simple_ttf: Invalid normalization height. Exiting. \n");
+		exit(1);
+	}
+	
+	uint8_t *temp_bd = (uint8_t *) malloc(height * bd->width);
+	memset(temp_bd, off, (height-bd->height)*bd->width);
+	memcpy(temp_bd + (height-bd->height)*bd->width, bd->color_map, bd->height * bd->width);
+
+	bd->height = height;
+	free(bd->color_map);
+	bd->color_map = temp_bd;
+
+	return;
+}
+
+void normalize_byte_data_width(struct byte_data *bd, uint8_t off, uint8_t width)
+{
+	{ // Check the new width isn't larger than the old.
+		if(width < bd->width)
+		{
+			fprintf(stderr, "simple_ttf: can't normalize to be smaller. Exiting.\n");
+			exit(1);
+		}
+	} // End checking dimensions.
+	
+	/*
+	 * We will start by allocating the new array. Then, we memset it to off. 
+	 * Then, we iterate through each row of the new one, memcpying the old stuff in the "middle".
+	 * If we are adding an odd number of columns, we want the extra column to go on the right of the letter.
+	 * Thus, the column index of our startpoint is just (cols_to_add) // 2.
+	 */
+
+	uint8_t *temp = (uint8_t *) malloc(bd->height * width);
+	memset(temp, off, bd->height * width);
+	
+	int cols_to_add = width - bd->width;
+	int col_start_point = cols_to_add / 2;
+	for(int row=0; row<bd->height; ++row)
+	{
+		int dest_row_start_index = row * width;
+		memcpy(temp + dest_row_start_index + col_start_point, bd->color_map + row*bd->width, bd->width);
+	}
+
+	free(bd->color_map);
+	bd->color_map = temp;
+	bd->width = width;
+}
+
+
+
+void generate_file(const char *filename, int font_px)
+{
+	/* We will go through all characters between 32( ) and 126(~), extract their bitmaps.
+	 * We will convert them to a common height. We will then ensure they all are 
+	 * of the same width. Assuming that is the case, we will make our record which is:
+	 * uint8_t height, uint8_t width, uint8_t bitmaps[(126-32 + 1)*height*width] */
+	
+	FILE *fp = fopen(filename, "rb");
+	if (!fp)
+	{
+		fprintf(stderr, "simple_ttf: failed to open %s. \n", filename);
+		exit(1);
+	}
+	struct header_contents header = S_TTF_read_header(fp);
+	struct cmap_indices cmap =  parse_cmap(header, fp);
+
+
+
+	// Now let's iterate through, and start getting the pixel datas. At this point, we only want to do two things:
+	// 1.) Find the largest height, so that we can normalize them. 2.) Find the largest width, should we require normalization.
+	uint8_t largest_height = 0;
+	uint8_t largest_width = 0;
+	for (char c=32; c<=126; ++c)
+	{
+		uint16_t glyph = glyph_index(c, cmap);
+		struct EBLC_information eblc = parse_EBLC(glyph, font_px, header, fp);
+		struct TTF_info ttf = {header, cmap, eblc, fp};
+		struct pixel_data pd = read_EBDT(eblc, header, fp);
+
+
+		if(pd.height > largest_height){largest_height = pd.height;}
+		if(pd.width  > largest_width) {largest_width  = pd.width; }
+
+		free(pd.pixel_data);
+	}
+
+	{// Ensure the largest height doesn't exceed the font_px
+		if (largest_height > font_px)
+		{
+			fprintf(stderr, "simple_ttf: font has char whose height exceeds strike. Exiting. \n");
+			exit(1);
+		}
+	} // End ensure the largest height doesn't exceed font_px.
+	
+	// Force it to be the expected height. 
+	largest_height = font_px;
+
+	/* Now, we will just normalize everything, and add all of the byte data uint8_t arrays
+	 * to another 1d array, the bitmaps array, as described above. The index of each array is just
+	 * (char c - 32) * largest_width * largest_height.
+	 * */
+
+	uint8_t *bitmaps = (uint8_t *) malloc((126-32 +1) * largest_height * largest_width);
+	for(char c=32; c<=126; ++c)
+	{
+		uint16_t glyph = glyph_index(c, cmap);
+		struct EBLC_information eblc = parse_EBLC(glyph, font_px, header, fp);
+		struct TTF_info ttf = {header, cmap, eblc, fp};
+		struct pixel_data pd = read_EBDT(eblc, header, fp);
+	
+		struct byte_data bd = convert_to_bytes(pd, 0, 255);
+		normalize_byte_data_height(&bd, 255, largest_height);
+		normalize_byte_data_width(&bd, 255, largest_width);
+		
+		int bitmap_index = (c-32) * largest_width * largest_height;
+		memcpy(bitmaps + bitmap_index, bd.color_map, largest_height * largest_width);
+		free(bd.color_map);
+
+	}
+
+	// Print each char
+	/*
+	for(char c=0; c<(126-32 + 1); ++c)
+	{
+		printf("Char %c: \n", c+32);
+		for (int row=0; row<largest_height; ++row)
+		{
+			for(int col=0; col<largest_width; ++col)
+			{
+				int index = c * (largest_width * largest_height) + row*largest_width + col;
+				printf("%u", bitmaps[index]);
+			}
+			printf("\n");
+		}
+		printf("\n\n\n");
+
+	}
+	*/
+
+	// Now, we need to manually write the array. We will just print it. We can redirect it to a file if need be.
+	printf("const uint8_t font[] = { ");
+	for(int i=0; i<(126-32 + 1) * largest_height * largest_width; ++i)
+	{
+		printf("0x%x, ", bitmaps[i]);
+	}
+	printf("};\n\n");
+
+	printf("const uint8_t font_width = %u;\n", largest_width);
+	printf("const uint8_t font_height = %u;\n", largest_height);
+
+
+	free(bitmaps);
+	fclose(fp);
+
+}
+
+
+
 void read_ttf(const char *filename)
 {
 	FILE *fp = fopen(filename, "rb");
@@ -603,13 +1057,13 @@ void read_ttf(const char *filename)
 	struct header_contents header = S_TTF_read_header(fp);
 	struct cmap_indices cmap =  parse_cmap(header, fp);
 	uint16_t glyph = glyph_index('m', cmap);
-	printf("%hu \n", glyph);
+	//printf("%hu \n", glyph);
 	struct EBLC_information eblc = parse_EBLC(glyph, 8, header, fp);
+
+	struct TTF_info ttf = {header, cmap, eblc, fp};
 	struct pixel_data pd = read_EBDT(eblc, header, fp);
 	
-	fix_endianness(pd.pixel_data, pd.bytes_to_read);
-	print_binary(pd.pixel_data, pd.bytes_to_read);
-	printf("%d %d \n", pd.height, pd.width);
+
 
 
 	fclose(fp);
@@ -620,6 +1074,9 @@ void read_ttf(const char *filename)
 
 int main()
 {
-	read_ttf("resources/Pixolletta8px2.ttf");	
+	//read_ttf("resources/Pixolletta8px2.ttf");	
+	generate_file("resources/PixelOperatorMono82.ttf", 8);
+	
+
 
 }
