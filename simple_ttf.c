@@ -63,6 +63,7 @@ struct cmap_indices
 	uint16_t *endcodes;
 	uint16_t *startcodes;
 	uint16_t *id_deltas;
+	uint16_t *id_range_offsets;
 };
 
 struct EBLC_information
@@ -165,7 +166,6 @@ static struct header_contents S_TTF_read_header(FILE *fp)
 				header.offset_EBDT = table_offset;
 				header.length_EBDT = table_length;
 			}
-			//printf("%s\n", table_name);
 		}
 
 	} // Reading each of the tables. 
@@ -272,11 +272,13 @@ static struct cmap_indices parse_cmap(struct header_contents header, FILE *fp)
 		 */
 
 		output.segcountX1 = segcountX2 / 2;
-		output.endcodes = (uint16_t*) malloc(segcountX2);
-		output.startcodes = (uint16_t*) malloc(segcountX2);
-		output.id_deltas = (uint16_t*) malloc(segcountX2); 
+		output.endcodes = (uint16_t*) malloc(2 * output.segcountX1);
+		output.startcodes = (uint16_t*) malloc(2 * output.segcountX1);
+		output.id_deltas = (uint16_t*) malloc(2 * output.segcountX1); 
+		output.id_range_offsets = (uint16_t*) malloc(2 * output.segcountX1); 
+		
 
-		for (int i=0; i<segcountX2; i+=2)
+		for (int i=0; i<output.segcountX1; ++i)
 		{
 			fread(&(output.endcodes[i]), 2, 1, fp);
 			fix_endianness(&(output.endcodes[i]), 2);
@@ -285,31 +287,25 @@ static struct cmap_indices parse_cmap(struct header_contents header, FILE *fp)
 		// Skip the reserved_pad
 		fseek(fp, 2, SEEK_CUR);
 
-		for (int i=0; i<segcountX2; i+=2)
+		for (int i=0; i<output.segcountX1; ++i)
 		{
 			fread(&(output.startcodes[i]), 2, 1, fp);
-			fix_endianness(&(output.startcodes[1]), 2);
+			fix_endianness(&(output.startcodes[i]), 2);
 		}
 
-		for (int i=0; i<segcountX2; i+=2)
+		for (int i=0; i<output.segcountX1; ++i)
 		{
 			fread(&(output.id_deltas[i]), 2, 1, fp);
 			fix_endianness(&(output.id_deltas[i]), 2);
 		}
 
-		{ // We will not currently support id_range_offset == 1. Check.
-			uint16_t id_range_offset;
-			for (int i=0; i<segcountX2; i+=2)
+		{ // We now support nonzero id range offsets.
+			for (int i=0; i<output.segcountX1; ++i)
 			{
-				fread(&id_range_offset, 2, 1, fp);
-				fix_endianness(&id_range_offset, 2);
-				if (id_range_offset != 0)
-				{
-					fprintf(stderr, "simple_ttf: nonzero id_range_offset not supported. Exiting.\n");
-					exit(1);
-				}
+				fread(&output.id_range_offsets[i], 2, 1, fp);
+				fix_endianness(&output.id_range_offsets[i], 2);
 			}
-		} // End verifying that all id_range_offset are zero.
+		} // end storing id range offsets
 
 	} // End parsing the subtable.
 
@@ -354,7 +350,19 @@ static uint16_t glyph_index(char c, struct cmap_indices cmap)
 		c_segment = closest_endcode_i;
 	} // End searching for the correct segment
 	
-	glyph_index = c_int + cmap.id_deltas[c_segment];
+
+	if (cmap.id_range_offsets[c_segment] == 0)
+	{
+		glyph_index = c_int + cmap.id_deltas[c_segment];
+	}
+	else 
+	{
+		/* Ripped straight from the official opentype documentation */
+		glyph_index = *(cmap.id_range_offsets[c_segment]/2
+            + (c_int - cmap.startcodes[c_segment] )
+            + &cmap.id_range_offsets[c_segment]);	
+	}
+
 	return glyph_index;
 }
 
@@ -1057,7 +1065,6 @@ void read_ttf(const char *filename)
 	struct header_contents header = S_TTF_read_header(fp);
 	struct cmap_indices cmap =  parse_cmap(header, fp);
 	uint16_t glyph = glyph_index('m', cmap);
-	//printf("%hu \n", glyph);
 	struct EBLC_information eblc = parse_EBLC(glyph, 8, header, fp);
 
 	struct TTF_info ttf = {header, cmap, eblc, fp};
